@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Start, stop or check the Claude Workshop viewer.
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+REPO="$(dirname "$(dirname "$SELF")")"
+STATE="${WORKSHOP_STATE:-$HOME/.local/state/claude-workshop}"
+PORT="${WORKSHOP_PORT:-4186}"
+URL="http://127.0.0.1:${PORT}"
+PIDFILE="$STATE/server.pid"
+LOG="$STATE/server.log"
+
+usage() {
+  cat <<USAGE
+Usage: claude-workshop [start|stop|status|--help]
+
+  (none), start   start the local server if needed and open the window
+  stop            stop the server this launcher started
+  status          show whether the server is running
+USAGE
+}
+
+# Succeeds if the pid file names a live process running server.py.
+server_pid() {
+  local pid
+  [ -f "$PIDFILE" ] || return 1
+  pid="$(tr -dc '0-9' < "$PIDFILE")"
+  [ -n "$pid" ] || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'server\.py' || return 1
+  echo "$pid"
+}
+
+answers() { curl -fs --max-time 1 "$URL/theme" >/dev/null 2>&1; }
+
+start_server() {
+  mkdir -p "$STATE"
+  if server_pid >/dev/null && answers; then
+    echo "server already running (pid $(server_pid))"
+    return 0
+  fi
+  if answers && ! server_pid >/dev/null; then
+    echo "already running (unmanaged)"
+    return 0
+  fi
+  rm -f "$PIDFILE"
+  # exec keeps the shell's PID, so the pid file holds the real python PID.
+  setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$PIDFILE" \
+    python3 "$REPO/server.py" --port "$PORT" >>"$LOG" 2>&1 </dev/null &
+  local i
+  for i in $(seq 1 30); do
+    answers && { echo "server started (pid $(server_pid))"; return 0; }
+    sleep 0.1
+  done
+  echo "claude-workshop: server did not answer on $URL within 3s; see $LOG" >&2
+  return 1
+}
+
+open_window() {
+  if hyprctl clients -j 2>/dev/null | python3 -c '
+import json, sys
+try:
+    sys.exit(0 if any(c.get("class") == "claude-workshop" or c.get("title") == "Claude Workshop" for c in json.load(sys.stdin)) else 1)
+except Exception:
+    sys.exit(1)
+'; then
+    echo "already open"
+    return 0
+  fi
+  hyprctl dispatch "hl.dsp.exec_cmd(\"chromium --app=${URL} --class=claude-workshop --user-data-dir='${STATE}/chromium' --no-first-run\", { workspace = \"8 silent\" })"
+}
+
+stop_server() {
+  local pid
+  if pid="$(server_pid)"; then
+    kill "$pid"
+    echo "stopped (pid $pid)"
+  else
+    echo "not running"
+  fi
+  rm -f "$PIDFILE"
+}
+
+status_server() {
+  local pid
+  if pid="$(server_pid)"; then
+    echo "running pid $pid $URL"
+  else
+    echo "stopped $URL"
+  fi
+}
+
+case "${1:-start}" in
+  start) start_server; open_window ;;
+  stop) stop_server ;;
+  status) status_server ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
